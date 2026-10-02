@@ -9,7 +9,7 @@ module gridorbital
   implicit none
   private
 
-  public :: TGridorb1, TGridorb1_init, TGridorb2, TGridorb2_init
+  public :: TGridorb1, TGridorb1_init, TGridorb2, TGridorb2_init, TGridStencil, getStencil
 
 
   !> Contains the data of a grid function.
@@ -47,6 +47,7 @@ module gridorbital
   contains
 
     procedure :: getValue => TGridorb2_getValue
+    procedure :: getValueStencil => TGridorb2_getValueStencil
     procedure :: rescale => TGridorb2_rescale
     procedure :: destruct => TGridorb2_destruct
 
@@ -54,6 +55,19 @@ module gridorbital
 
 
   !> Wraps around TGridorb1 pointer.
+  !> Interpolation stencil of a set of radii on the grid shared by all TGridorb2 instances, so the
+  !! index search and Lagrange weights are computed once for every function on an atom.
+  type TGridStencil
+
+    !> first grid index of the stencil of each radius
+    integer, allocatable :: iStart(:)
+
+    !> Lagrange weights of the stencil points, shape (ninter2, number of radii)
+    real(dp), allocatable :: ww(:,:)
+
+  end type TGridStencil
+
+
   type TGridorb1Wrap
     type(TGridorb1), pointer :: ptr => null()
   end type TGridorb1Wrap
@@ -279,6 +293,61 @@ contains
     end if
 
   end function TGridorb2_getValue
+
+
+  !> Builds the interpolation stencil of TGridorb2_getValue for the radii rr.
+  subroutine getStencil(orb, rr, stencil)
+
+    !> any grid-orbital instance (all share the same grid)
+    class(TGridorb2), intent(in) :: orb
+
+    !> radii to interpolate at
+    real(dp), intent(in) :: rr(:)
+
+    !> resulting stencil
+    type(TGridStencil), intent(out) :: stencil
+
+    integer :: ii, jj, kk, ind, iEnd
+    real(dp) :: xn(ninter2)
+
+    allocate(stencil%iStart(size(rr)), stencil%ww(ninter2, size(rr)))
+    do ii = 1, size(rr)
+      ind = floor(acos((1.0_dp - rr(ii)) / (1.0_dp + rr(ii))) / orb%delta)
+      if (ind >= orb%nGrid) error stop "getStencil: radius beyond the grid-orbital grid"
+      iEnd = max(min(orb%nGrid, ind + nrightinter2), ninter2)
+      stencil%iStart(ii) = iEnd - ninter2 + 1
+      xn(:) = orb%rvalues(stencil%iStart(ii):iEnd)
+      do kk = 1, ninter2
+        stencil%ww(kk, ii) = 1.0_dp
+        do jj = 1, ninter2
+          if (jj /= kk) stencil%ww(kk, ii) = stencil%ww(kk, ii) * (rr(ii) - xn(jj)) / (xn(kk) - xn(jj))
+        end do
+      end do
+    end do
+
+  end subroutine getStencil
+
+
+  !> Value of the grid orbital at the radii of a precomputed stencil.
+  pure function TGridorb2_getValueStencil(this, stencil) result(vals)
+
+    !> grid-orbital instance
+    class(TGridorb2), intent(in) :: this
+
+    !> stencil from getStencil
+    type(TGridStencil), intent(in) :: stencil
+
+    !> interpolated values
+    real(dp) :: vals(size(stencil%iStart))
+
+    integer :: ii, i0
+
+    do ii = 1, size(vals)
+      i0 = stencil%iStart(ii)
+      vals(ii) = dot_product(stencil%ww(:, ii), this%fvalues(i0:i0 + ninter2 - 1))
+    end do
+
+  end function TGridorb2_getValueStencil
 
 
   !> Rescales stored values f(r) of a grid-orbital instance.

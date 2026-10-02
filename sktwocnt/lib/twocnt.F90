@@ -25,7 +25,7 @@ module twocnt
   use extlibs_mpifx, only : MPI_SUM, MPI_MAX, mpifx_allreduceip
 #:endif
 
-  use gridorbital, only : TGridorb2
+  use gridorbital, only : TGridorb2, TGridStencil, getStencil
   use xcfunctionals, only : xcFunctional
 
   use, intrinsic :: iso_c_binding, only : c_size_t
@@ -47,6 +47,11 @@ module twocnt
 
   public :: TTwocntInp, TAtomdata, TIntegMap
   public :: get_twocenter_integrals
+
+  !> Spline-derivative matrices of the fixed radial and angular nodes of the dimer grid; the nodes
+  !! do not depend on the distance, so the cubic-spline derivative is the same linear map for all
+  !! grid lines and all distances.
+  real(dp), allocatable :: derivR(:,:), derivT(:,:)
 
 
   ! Holds properties associated with a single atom.
@@ -542,6 +547,9 @@ contains
     !! instance of real tesseral spherical harmonics
     type(TRealTessY) :: tes1, tes2
 
+    !! interpolation stencils of the radii r1 and r2
+    type(TGridStencil) :: sten1, sten2
+
     !! spherical coordinates (r, theta) of atom 1 and atom 2 on grid
     real(dp), pointer :: r1(:), r2(:), theta1(:), theta2(:)
 
@@ -584,7 +592,7 @@ contains
     !! libxc related objects
     real(dp), allocatable :: vxc(:), vx(:), vx_sr(:), vc(:)
     real(dp), allocatable :: rhor(:), sigma(:), vxcsigma(:), vxsigma(:), vxsigma_sr(:), vcsigma(:)
-    real(dp), allocatable :: divvxc(:), divvx(:), divvc(:)
+    real(dp), allocatable :: divvxc(:), divvc(:)
 
     r1 => grid1(:, 1)
     theta1 => grid1(:, 2)
@@ -600,23 +608,26 @@ contains
     allocate(spherval1(nGrid))
     allocate(spherval2(nGrid))
 
+    call getStencil(atom1%rad(1), r1, sten1)
+    call getStencil(atom2%rad(1), r2, sten2)
+
     ! get radial portions of all basis functions of atom 1
     do ii = 1, size(radval1, dim=2)
-      radval1(:, ii) = atom1%rad(ii)%getValue(r1)
+      radval1(:, ii) = atom1%rad(ii)%getValueStencil(sten1)
     end do
 
     ! get radial portions (and derivatives) of all basis functions of atom 2
     do ii = 1, size(radval2, dim=2)
-      radval2(:, ii) = atom2%rad(ii)%getValue(r2)
-      radval2p(:, ii) = atom2%drad(ii)%getValue(r2)
-      radval2pp(:, ii) = atom2%ddrad(ii)%getValue(r2)
+      radval2(:, ii) = atom2%rad(ii)%getValueStencil(sten2)
+      radval2p(:, ii) = atom2%drad(ii)%getValueStencil(sten2)
+      radval2pp(:, ii) = atom2%ddrad(ii)%getValueStencil(sten2)
     end do
 
     ifPotSup: if (.not. tDensitySuperpos) then
-      potval = atom1%pot%getValue(r1) + atom2%pot%getValue(r2)
+      potval = atom1%pot%getValueStencil(sten1) + atom2%pot%getValueStencil(sten2)
     else
       allocate(densval(nGrid))
-      densval(:) = atom1%rho%getValue(r1) + atom2%rho%getValue(r2)
+      densval(:) = atom1%rho%getValueStencil(sten1) + atom2%rho%getValueStencil(sten2)
 
       ! prepare xc-functional specific arrays
       ! care about correct 4pi normalization of density
@@ -630,8 +641,8 @@ contains
         vxsigma(:) = 0.0_dp
         allocate(vcsigma(nGrid))
         vcsigma(:) = 0.0_dp
-        densval1p = atom1%drho%getValue(r1)
-        densval2p = atom2%drho%getValue(r2)
+        densval1p = atom1%drho%getValueStencil(sten1)
+        densval2p = atom2%drho%getValueStencil(sten2)
         ! care about correct 4pi normalization of density and compute sigma
         sigma = getLibxcSigma(densval1p, densval2p, dots)
       end if
@@ -660,9 +671,10 @@ contains
       case(xcFunctional%GGA_PBE96, xcFunctional%GGA_BLYP, xcFunctional%LCY_PBE96)
         call xc_f03_gga_vxc(xcfunc_x, nGridLibxc, rhor(1), sigma(1), vx(1), vxsigma(1))
         call xc_f03_gga_vxc(xcfunc_c, nGridLibxc, rhor(1), sigma(1), vc(1), vcsigma(1))
-        call getDivergence(nRad, nAng, densval1p, densval2p, r1, r2, theta1, theta2, vxsigma, divvx)
-        call getDivergence(nRad, nAng, densval1p, densval2p, r1, r2, theta1, theta2, vcsigma, divvc)
-        potval = vx + vc + divvx + divvc
+        ! the divergence term is linear in vsigma
+        call getDivergence(nRad, nAng, densval1p, densval2p, r1, r2, theta1, theta2,&
+            & vxsigma + vcsigma, divvxc)
+        potval = vx + vc + divvxc
       ! 5: LCY-BNL
       case(xcFunctional%LCY_BNL)
         call xc_f03_lda_vxc(xcfunc_x, nGridLibxc, rhor(1), vx(1))
@@ -703,7 +715,7 @@ contains
         potval = vxc + divvxc
       end select
       ! add nuclear and coulomb potential to obtain the effective potential
-      potval(:) = potval + atom1%pot%getValue(r1) + atom2%pot%getValue(r2)
+      potval(:) = potval + atom1%pot%getValueStencil(sten1) + atom2%pot%getValueStencil(sten2)
     end if ifPotSup
 
     denserr = 0.0_dp
@@ -909,19 +921,19 @@ contains
     real(dp), intent(out), allocatable :: divv(:)
 
     !!
-    integer :: nn, ia, ir
+    integer :: nn
 
     !! radii and theta values of the grid
     real(dp), allocatable :: rval(:), tval(:)
 
     !!
-    real(dp), allocatable :: aa(:,:), dar(:), dat(:), bb(:,:)
+    real(dp), allocatable :: aa(:,:), bb(:,:)
 
     allocate(divv(size(drho1)))
     divv(:) = 0.0_dp
     nn = size(drho1) / 2
 
-    allocate(dar(nRad), dat(nAng), rval(nRad), bb(nRad, nAng))
+    allocate(rval(nRad), bb(nRad, nAng))
 
     ! rval holds radii of the grid
     rval = r1(1:nRad)
@@ -943,11 +955,14 @@ contains
         & * (drho1(1:nn) + cos(theta2(1:nn) - theta1(1:nn)) * drho2(1:nn)) * r1(1:nn)**2,&
         & [nRad, nAng])
 
+    if (.not. allocated(derivR)) then
+      call getSplineDerivMatrix(rval, derivR)
+      call getSplineDerivMatrix(tval(nAng:1:-1), derivT)
+      derivT(:,:) = derivT(nAng:1:-1, nAng:1:-1)
+    end if
+
     ! take numerical derivative w.r.t. r1
-    do ia = 1, nAng
-      call spline3ders(rval, aa(:, ia), rval, dynew=dar)
-      bb(:, ia) = dar
-    end do
+    call dgemm('N', 'N', nRad, nAng, nRad, 1.0_dp, derivR, nRad, aa, nRad, 0.0_dp, bb, nRad)
     divv(1:nn) = reshape(bb, [nRad * nAng]) / r1(1:nn)**2
 
     !! elements > nn refer to: atom1(r2b) -- atom2(r1)
@@ -955,10 +970,7 @@ contains
         & * (drho2(nn+1:2*nn) + cos(theta1(nn+1:2*nn) - theta2(nn+1:2*nn)) * drho1(nn+1:2*nn))&
         & * r2(nn+1:2*nn)**2, [nRad, nAng])
 
-    do ia = 1, nAng
-      call spline3ders(rval, aa(:, ia), rval, dynew=dar)
-      bb(:, ia) = dar
-    end do
+    call dgemm('N', 'N', nRad, nAng, nRad, 1.0_dp, derivR, nRad, aa, nRad, 0.0_dp, bb, nRad)
     divv(nn+1:2*nn) = reshape(bb, [nRad * nAng]) / r2(nn+1:2*nn)**2
 
     ! take numerical derivative w.r.t. theta1
@@ -966,21 +978,14 @@ contains
         & * (sin(theta2(1:nn) - theta1(1:nn)) * drho2(1:nn)) * sin(theta1(1:nn)),&
         & [nRad, nAng])
 
-    !! spline3der requires data in ascending order
-    do ir = 1, nRad
-      call spline3ders(tval(nAng:1:-1), aa(ir,nAng:1:-1), tval(nAng:1:-1), dynew=dat)
-      bb(ir, :) = dat(nAng:1:-1)
-    end do
+    call dgemm('N', 'T', nRad, nAng, nAng, 1.0_dp, aa, nRad, derivT, nAng, 0.0_dp, bb, nRad)
     divv(1:nn) = divv(1:nn) + reshape(bb, [nRad * nAng]) / (r1(1:nn) * sin(theta1(1:nn)))
 
     aa(:,:) = reshape(rec4pi * vsigma(nn+1:2*nn)&
         & * (sin(theta1(nn+1:2*nn) - theta2(nn+1:2*nn)) * drho1(nn+1:2*nn)) * sin(theta1(1:nn)),&
         & [nRad, nAng])
 
-    do ir = 1, nRad
-      call spline3ders(tval(nAng:1:-1), aa(ir,nAng:1:-1), tval(nAng:1:-1), dynew=dat)
-      bb(ir, :) = dat(nAng:1:-1)
-    end do
+    call dgemm('N', 'T', nRad, nAng, nAng, 1.0_dp, aa, nRad, derivT, nAng, 0.0_dp, bb, nRad)
     divv(nn+1:2*nn) = divv(nn+1:2*nn) + reshape(bb, [nRad * nAng]) / (r1(1:nn) * sin(theta1(1:nn)))
 
     ! pre-factor
@@ -990,6 +995,28 @@ contains
 
 
   !> Calculates overlap for a fixed orbital and interaction configuration.
+  !> Matrix D with dy = D y for the cubic spline of spline3ders, built column by column.
+  subroutine getSplineDerivMatrix(xx, dmat)
+
+    !> spline nodes, ascending
+    real(dp), intent(in) :: xx(:)
+
+    !> derivative matrix at the nodes
+    real(dp), intent(out), allocatable :: dmat(:,:)
+
+    real(dp), allocatable :: unit(:)
+    integer :: ii
+
+    allocate(dmat(size(xx), size(xx)), unit(size(xx)))
+    do ii = 1, size(xx)
+      unit(:) = 0.0_dp
+      unit(ii) = 1.0_dp
+      call spline3ders(xx, unit, xx, dynew=dmat(:, ii))
+    end do
+
+  end subroutine getSplineDerivMatrix
+
+
   pure function getOverlap(rad1, rad2, spher1, spher2, weights) result(res)
 
     !> radial grid-orbital portion of atom 1 and atom 2
